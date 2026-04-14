@@ -49,61 +49,152 @@ pub fn rdtscp() -> u64 {
     }
 }
 
+/// serialized start timestamp: lfence drains the pipeline then rdtsc reads.
+/// use this for the START of a measurement interval.
+/// cost: ~5-10 cycles more than plain rdtsc, but prevents ooo reordering.
+#[inline(always)]
+#[cfg(target_arch = "x86_64")]
+pub fn rdtsc_start() -> u64 {
+    unsafe {
+        let lo: u32;
+        let hi: u32;
+        std::arch::asm!(
+            "lfence",
+            "rdtsc",
+            out("eax") lo,
+            out("edx") hi,
+            options(nostack, nomem),
+        );
+        ((hi as u64) << 32) | (lo as u64)
+    }
+}
+
+/// serialized end timestamp: rdtscp waits for prior instructions,
+/// lfence prevents later instructions from speculatively executing before read.
+/// use this for the END of a measurement interval.
+#[inline(always)]
+#[cfg(target_arch = "x86_64")]
+pub fn rdtsc_end() -> u64 {
+    unsafe {
+        let lo: u32;
+        let hi: u32;
+        let _aux: u32;
+        std::arch::asm!(
+            "rdtscp",
+            "lfence",
+            out("eax") lo,
+            out("edx") hi,
+            out("ecx") _aux,
+            options(nostack, nomem),
+        );
+        ((hi as u64) << 32) | (lo as u64)
+    }
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+pub fn rdtsc() -> u64 {
+    0
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+pub fn rdtscp() -> u64 {
+    0
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+pub fn rdtsc_start() -> u64 {
+    0
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+pub fn rdtsc_end() -> u64 {
+    0
+}
+
+/// checks if the cpu supports invariant tsc (constant rate regardless of p-states)
+///
+/// queries cpuid leaf 0x80000007, edx bit 8.
+/// without invariant tsc, rdtsc frequency changes with cpu frequency scaling.
+#[cfg(target_arch = "x86_64")]
+pub fn has_invariant_tsc() -> bool {
+    unsafe {
+        let edx: u32;
+        std::arch::asm!(
+            "push rbx",
+            "mov eax, 0x80000007",
+            "cpuid",
+            "pop rbx",
+            out("edx") edx,
+            inout("eax") 0x80000007u32 => _,
+            out("ecx") _,
+            options(nomem, preserves_flags),
+        );
+        (edx & (1 << 8)) != 0
+    }
+}
+
 /// calibrates the cpu frequency by measuring rdtsc over a known time period
 ///
+/// takes multiple samples and uses the maximum observed frequency
+/// to reduce impact of os scheduling/preemption on accuracy.
 /// returns the frequency in cycles per second.
 #[cfg(target_arch = "x86_64")]
 pub fn calibrate_frequency() -> u64 {
-    // warm up
-    for _ in 0..10 {
+    // warm up tsc and caches
+    for _ in 0..100 {
         rdtsc();
     }
 
-    // measure over 100ms for accuracy
-    let duration = Duration::from_millis(100);
+    // take 5 samples of 20ms each, use max (least affected by preemption)
+    let mut best_freq: u64 = 0;
 
-    let start_instant = Instant::now();
-    let start_cycles = rdtsc();
+    for _ in 0..5 {
+        let duration = Duration::from_millis(20);
 
-    // busy wait for duration
-    while start_instant.elapsed() < duration {
-        std::hint::spin_loop();
+        let start_instant = Instant::now();
+        let start_cycles = rdtsc();
+
+        while start_instant.elapsed() < duration {
+            std::hint::spin_loop();
+        }
+
+        let end_cycles = rdtsc();
+        let elapsed = start_instant.elapsed();
+
+        let cycles = end_cycles - start_cycles;
+        let nanos = elapsed.as_nanos();
+
+        let freq = ((cycles as u128 * 1_000_000_000) / nanos) as u64;
+        best_freq = best_freq.max(freq);
     }
 
-    let end_cycles = rdtsc();
-    let elapsed = start_instant.elapsed();
-
-    // calculate frequency
-    let cycles = end_cycles - start_cycles;
-    let nanos = elapsed.as_nanos();
-
-    // cycles per nanosecond * 1e9 = cycles per second
-    ((cycles as u128 * 1_000_000_000) / nanos) as u64
+    best_freq
 }
 
-/// converts cpu cycles to nanoseconds using calibrated frequency
+/// converts cpu cycles to nanoseconds using precomputed Q32 fixed-point multiplier
+///
+/// uses (cycles * multiplier) >> 32 instead of u128 division.
+/// single mulq + shift (~3-4 cycles) vs __udivti3 (~40-80 cycles).
 #[inline(always)]
 pub fn cycles_to_nanos(cycles: u64) -> u64 {
-    let freq = super::cpu_frequency();
-    if freq == 0 {
-        // not calibrated, assume 3ghz
+    let mult = super::nanos_multiplier();
+    if mult == 0 {
+        // not calibrated, assume ~3ghz
         cycles / 3
     } else {
-        // multiply by 1e9 and divide by frequency
-        ((cycles as u128 * 1_000_000_000) / freq as u128) as u64
+        ((cycles as u128 * mult as u128) >> 32) as u64
     }
 }
 
-/// converts nanoseconds to cpu cycles using calibrated frequency
+/// converts nanoseconds to cpu cycles using precomputed Q32 fixed-point multiplier
 #[inline(always)]
 pub fn nanos_to_cycles(nanos: u64) -> u64 {
-    let freq = super::cpu_frequency();
-    if freq == 0 {
-        // not calibrated, assume 3ghz
+    let mult = super::cycles_multiplier();
+    if mult == 0 {
+        // not calibrated, assume ~3ghz
         nanos * 3
     } else {
-        // multiply by frequency and divide by 1e9
-        ((nanos as u128 * freq as u128) / 1_000_000_000) as u64
+        ((nanos as u128 * mult as u128) >> 32) as u64
     }
 }
 
@@ -118,8 +209,10 @@ pub fn fence() {
 #[cfg(target_arch = "x86_64")]
 pub fn serialize() {
     unsafe {
-        // cpuid is a serializing instruction
-        // note: rbx is reserved by llvm, so we need to save/restore it?
+        // cpuid is a serializing instruction.
+        // rbx is reserved by llvm for PIC/GOT base -- lateout("ebx") is rejected,
+        // so we manually save/restore via push/pop. nostack is intentionally omitted
+        // to let llvm account for the stack usage.
         std::arch::asm!(
             "push rbx",
             "cpuid",
@@ -131,6 +224,10 @@ pub fn serialize() {
         );
     }
 }
+
+#[inline(always)]
+#[cfg(not(target_arch = "x86_64"))]
+pub fn serialize() {}
 
 #[cfg(test)]
 mod tests {

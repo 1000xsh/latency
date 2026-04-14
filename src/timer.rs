@@ -153,6 +153,7 @@ impl ScopedTimer {
 
         self.histogram.record(elapsed);
 
+        #[cfg(debug_assertions)]
         if elapsed > self.threshold_ns {
             eprintln!("operation exceeded threshold: {}μs", elapsed / 1000);
         }
@@ -162,7 +163,7 @@ impl ScopedTimer {
 
     /// times a closure with a name for debugging
     #[inline(always)]
-    pub fn time_named<F, R>(&self, name: &str, f: F) -> R
+    pub fn time_named<F, R>(&self, _name: &str, f: F) -> R
     where
         F: FnOnce() -> R,
     {
@@ -172,10 +173,11 @@ impl ScopedTimer {
 
         self.histogram.record(elapsed);
 
+        #[cfg(debug_assertions)]
         if elapsed > self.threshold_ns {
             eprintln!(
                 "operation '{}' exceeded threshold: {}μs",
-                name,
+                _name,
                 elapsed / 1000
             );
         }

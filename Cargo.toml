@@ -1,8 +1,8 @@
 [package]
 name = "latency"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
-description = "Ultra-low-latency timing library with nanosecond precision for performance-critical applications"
+description = "low-latency timing library"
 license = "MIT"
 repository = "https://github.com/1000xsh/latency"
 homepage = "https://1000x.sh"
@@ -13,7 +13,7 @@ categories = ["development-tools::profiling"]
 
 [dev-dependencies]
 # for testing
-criterion = "0.8"
+solana-measure = "3.1.13"
 
 [features]
 default = ["enabled"]

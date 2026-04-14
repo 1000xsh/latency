@@ -5,24 +5,69 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-/// number of buckets in the histogram
-/// covers range from 1ns to ~4.6 hours with logarithmic distribution
-const NUM_BUCKETS: usize = 64;
+/// sub-bucket precision bits: 3 gives 8 sub-buckets per power-of-2 range (~12.5% error).
+/// hot-path cost is identical to pure log2 -- just bit shifts and masks.
+const SUB_BITS: u32 = 3;
+const SUB_BUCKETS: usize = 1 << SUB_BITS; // 8
+
+/// total buckets: linear region (8) + 61 magnitude groups * 8 sub-buckets = 496
+/// covers u64 range from 1ns to ~584 years with ~12.5% precision at every scale.
+/// bucket array = 496 * 8 = ~4KB (fits in L1 cache).
+const NUM_BUCKETS: usize = SUB_BUCKETS + (64 - SUB_BITS as usize) * SUB_BUCKETS; // 496
+
+/// cache-line-padded atomic to prevent false sharing between threads.
+/// each padded field occupies its own 64-byte cache line so concurrent
+/// writes to different fields don't bounce the same line.
+#[repr(align(64))]
+struct PaddedAtomicU64(AtomicU64);
+
+impl PaddedAtomicU64 {
+    const fn new(val: u64) -> Self {
+        Self(AtomicU64::new(val))
+    }
+
+    #[inline(always)]
+    fn load(&self, order: Ordering) -> u64 {
+        self.0.load(order)
+    }
+
+    #[inline(always)]
+    fn store(&self, val: u64, order: Ordering) {
+        self.0.store(val, order)
+    }
+
+    #[inline(always)]
+    fn fetch_add(&self, val: u64, order: Ordering) -> u64 {
+        self.0.fetch_add(val, order)
+    }
+
+    #[inline(always)]
+    fn compare_exchange_weak(
+        &self,
+        current: u64,
+        new: u64,
+        success: Ordering,
+        failure: Ordering,
+    ) -> Result<u64, u64> {
+        self.0.compare_exchange_weak(current, new, success, failure)
+    }
+}
 
 /// histogram for tracking latency distributions
 ///
 /// thread-safe using atomics for lock-free updates.
+/// hot statistics fields are cache-line-padded to prevent false sharing.
 pub struct Histogram {
     /// bucket counts
     buckets: [AtomicU64; NUM_BUCKETS],
-    /// total count of samples
-    count: AtomicU64,
-    /// sum of all samples (for mean calculation)
-    sum: AtomicU64,
-    /// minimum value seen
-    min: AtomicU64,
-    /// maximum value seen
-    max: AtomicU64,
+    /// total count of samples (padded to own cache line)
+    count: PaddedAtomicU64,
+    /// sum of all samples for mean calculation (padded)
+    sum: PaddedAtomicU64,
+    /// minimum value seen (padded)
+    min: PaddedAtomicU64,
+    /// maximum value seen (padded)
+    max: PaddedAtomicU64,
 }
 
 impl Histogram {
@@ -30,20 +75,16 @@ impl Histogram {
     pub fn new() -> Self {
         Self {
             buckets: std::array::from_fn(|_| AtomicU64::new(0)),
-            count: AtomicU64::new(0),
-            sum: AtomicU64::new(0),
-            min: AtomicU64::new(u64::MAX),
-            max: AtomicU64::new(0),
+            count: PaddedAtomicU64::new(0),
+            sum: PaddedAtomicU64::new(0),
+            min: PaddedAtomicU64::new(u64::MAX),
+            max: PaddedAtomicU64::new(0),
         }
     }
 
     /// records a value in nanoseconds
     #[inline(always)]
     pub fn record(&self, value_ns: u64) {
-        if value_ns == 0 {
-            return;
-        }
-
         // determine bucket index using logarithmic scaling
         let bucket = Self::value_to_bucket(value_ns);
 
@@ -93,14 +134,23 @@ impl Histogram {
 
     /// converts a value to bucket index
     ///
-    /// uses logarithmic scaling: bucket = floor(log2(value))
+    /// for values < 2^SUB_BITS (8): linear mapping (full precision).
+    /// for values >= 8: magnitude + top SUB_BITS after leading 1-bit.
+    /// all bit ops, no branches on hot path (except the magnitude check).
     #[inline(always)]
     fn value_to_bucket(value: u64) -> usize {
         if value == 0 {
-            0
+            return 0;
+        }
+        let mag = 63 - value.leading_zeros(); // floor(log2(value))
+        if mag < SUB_BITS {
+            // linear region: values 1..7 map to buckets 1..7
+            value as usize
         } else {
-            // count leading zeros and invert to get log2
-            let bucket = 63 - value.leading_zeros() as usize;
+            let shift = mag - SUB_BITS;
+            let sub = ((value >> shift) as usize) & (SUB_BUCKETS - 1);
+            let base = ((mag - SUB_BITS) as usize + 1) * SUB_BUCKETS;
+            let bucket = base + sub;
             bucket.min(NUM_BUCKETS - 1)
         }
     }
@@ -108,10 +158,15 @@ impl Histogram {
     /// converts a bucket index to the minimum value in that bucket
     #[inline(always)]
     fn bucket_to_value(bucket: usize) -> u64 {
-        if bucket == 0 {
-            0
+        if bucket < SUB_BUCKETS as usize {
+            // linear region
+            bucket as u64
         } else {
-            1u64 << bucket
+            let group = (bucket / SUB_BUCKETS) - 1; // 0-based magnitude group
+            let sub = bucket & (SUB_BUCKETS - 1);
+            let mag = group + SUB_BITS as usize; // actual magnitude
+            let shift = mag - SUB_BITS as usize;
+            (1u64 << mag) | ((sub as u64) << shift)
         }
     }
 
@@ -163,13 +218,12 @@ impl Histogram {
             return vec![0; percentiles.len()];
         }
 
-        // collect bucket counts
+        // collect cumulative bucket counts on the stack (no allocation)
+        let mut cum_counts = [0u64; NUM_BUCKETS];
         let mut cumulative = 0u64;
-        let mut buckets = Vec::with_capacity(NUM_BUCKETS);
         for i in 0..NUM_BUCKETS {
-            let bucket_count = self.buckets[i].load(Ordering::Relaxed);
-            cumulative += bucket_count;
-            buckets.push((Self::bucket_to_value(i), cumulative));
+            cumulative += self.buckets[i].load(Ordering::Relaxed);
+            cum_counts[i] = cumulative;
         }
 
         // calculate percentiles
@@ -177,11 +231,10 @@ impl Histogram {
         for &p in percentiles {
             let target = ((count as f64 * p / 100.0) as u64).max(1);
 
-            // find bucket containing target
             let mut value = 0u64;
-            for &(bucket_value, cum_count) in &buckets {
-                if cum_count >= target {
-                    value = bucket_value;
+            for i in 0..NUM_BUCKETS {
+                if cum_counts[i] >= target {
+                    value = Self::bucket_to_value(i);
                     break;
                 }
             }
@@ -283,30 +336,77 @@ mod tests {
     fn test_percentiles() {
         let hist = Histogram::new();
 
-        // record values 1-100
+        // record values 1-100 * 1000ns
         for i in 1..=100 {
-            hist.record(i * 1000); // in nanoseconds
+            hist.record(i * 1000);
         }
 
         let percentiles = hist.common_percentiles();
 
-        // p50 should be around 50,000
-        assert!(percentiles.p50 >= 32_768 && percentiles.p50 <= 65_536);
+        // p50 should be near 50_000ns (within ~12.5% bucket precision)
+        assert!(
+            percentiles.p50 >= 40_000 && percentiles.p50 <= 56_000,
+            "p50={} expected near 50000",
+            percentiles.p50
+        );
 
-        // p99 should be near 99,000
-        assert!(percentiles.p99 >= 65_536);
+        // p99 should be near 99_000ns
+        assert!(
+            percentiles.p99 >= 88_000 && percentiles.p99 <= 104_000,
+            "p99={} expected near 99000",
+            percentiles.p99
+        );
     }
 
     #[test]
     fn test_bucket_conversion() {
+        // linear region: values 0-7 map directly
         assert_eq!(Histogram::value_to_bucket(0), 0);
-        assert_eq!(Histogram::value_to_bucket(1), 0);
-        assert_eq!(Histogram::value_to_bucket(2), 1);
-        assert_eq!(Histogram::value_to_bucket(4), 2);
-        assert_eq!(Histogram::value_to_bucket(8), 3);
-        assert_eq!(Histogram::value_to_bucket(1024), 10);
-        assert_eq!(Histogram::value_to_bucket(1_000_000), 19); // ~1ms
-        assert_eq!(Histogram::value_to_bucket(1_000_000_000), 29); // ~1s
+        assert_eq!(Histogram::value_to_bucket(1), 1);
+        assert_eq!(Histogram::value_to_bucket(7), 7);
+
+        // magnitude 3 (values 8-15): 8 sub-buckets, each covers 1
+        assert_eq!(Histogram::value_to_bucket(8), 8);
+        assert_eq!(Histogram::value_to_bucket(15), 15);
+
+        // magnitude 4 (values 16-31): 8 sub-buckets, each covers 2
+        assert_eq!(Histogram::value_to_bucket(16), 16);
+        assert_eq!(Histogram::value_to_bucket(17), 16);
+        assert_eq!(Histogram::value_to_bucket(30), 23);
+        assert_eq!(Histogram::value_to_bucket(31), 23);
+
+        // round-trip: bucket_to_value gives lower bound of bucket
+        for v in [1u64, 7, 8, 15, 16, 31, 100, 1000, 1_000_000, 1_000_000_000] {
+            let bucket = Histogram::value_to_bucket(v);
+            let lower = Histogram::bucket_to_value(bucket);
+            assert!(
+                lower <= v,
+                "bucket_to_value({})={} > original value {}",
+                bucket,
+                lower,
+                v
+            );
+        }
+    }
+
+    #[test]
+    fn test_sub_bucket_precision() {
+        let hist = Histogram::new();
+
+        // at 1μs scale, should distinguish 1000ns from 1200ns
+        hist.record(1000);
+        hist.record(1200);
+
+        let b1 = Histogram::value_to_bucket(1000);
+        let b2 = Histogram::value_to_bucket(1200);
+        assert_ne!(b1, b2, "1000ns and 1200ns should be in different buckets");
+
+        // verify bucket lower bounds are reasonable
+        let v1 = Histogram::bucket_to_value(b1);
+        let v2 = Histogram::bucket_to_value(b2);
+        assert!(v1 <= 1000);
+        assert!(v2 <= 1200);
+        assert!(v2 > v1);
     }
 
     #[test]
@@ -321,5 +421,23 @@ mod tests {
         assert_eq!(hist.count(), 0);
         assert_eq!(hist.min(), 0);
         assert_eq!(hist.max(), 0);
+    }
+
+    #[test]
+    fn test_zero_value_is_recorded() {
+        let hist = Histogram::new();
+
+        hist.record(0);
+        hist.record(10);
+
+        assert_eq!(hist.count(), 2);
+        assert_eq!(hist.min(), 0);
+        assert_eq!(hist.max(), 10);
+
+        let percentiles = hist.common_percentiles();
+        assert_eq!(percentiles.p50, 0);
+
+        let exact = hist.percentiles(&[100.0]);
+        assert_eq!(exact[0], 10);
     }
 }
