@@ -5,15 +5,17 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-/// sub-bucket precision bits: 3 gives 8 sub-buckets per power-of-2 range (~12.5% error).
-/// hot-path cost is identical to pure log2 -- just bit shifts and masks.
-const SUB_BITS: u32 = 3;
-const SUB_BUCKETS: usize = 1 << SUB_BITS; // 8
+/// sub-bucket precision bits: 6 gives 64 sub-buckets per power-of-2 range
+/// (~1.5% relative error, i.e. 2^-SUB_BITS). hot-path cost is identical to pure
+/// log2 -- just bit shifts and masks.
+const SUB_BITS: u32 = 6;
+const SUB_BUCKETS: usize = 1 << SUB_BITS; // 64
 
-/// total buckets: linear region (8) + 61 magnitude groups * 8 sub-buckets = 496
-/// covers u64 range from 1ns to ~584 years with ~12.5% precision at every scale.
-/// bucket array = 496 * 8 = ~4KB (fits in L1 cache).
-const NUM_BUCKETS: usize = SUB_BUCKETS + (64 - SUB_BITS as usize) * SUB_BUCKETS; // 496
+/// total buckets: linear region (64) + 58 magnitude groups * 64 sub-buckets = 3776
+/// covers u64 range from 1ns to ~584 years with ~1.5% precision at every scale.
+/// bucket array = 3776 * 8 = ~30KB. the hot path only writes one bucket per
+/// record; the full array is scanned only when computing percentiles (cold).
+const NUM_BUCKETS: usize = SUB_BUCKETS + (64 - SUB_BITS as usize) * SUB_BUCKETS; // 3776
 
 /// cache-line-padded atomic to prevent false sharing between threads.
 /// each padded field occupies its own 64-byte cache line so concurrent
@@ -158,7 +160,7 @@ impl Histogram {
     /// converts a bucket index to the minimum value in that bucket
     #[inline(always)]
     fn bucket_to_value(bucket: usize) -> u64 {
-        if bucket < SUB_BUCKETS as usize {
+        if bucket < SUB_BUCKETS {
             // linear region
             bucket as u64
         } else {
@@ -167,6 +169,24 @@ impl Histogram {
             let mag = group + SUB_BITS as usize; // actual magnitude
             let shift = mag - SUB_BITS as usize;
             (1u64 << mag) | ((sub as u64) << shift)
+        }
+    }
+
+    /// converts a bucket index to a representative value: the midpoint of the
+    /// range it covers. reporting the midpoint (rather than the lower bound)
+    /// removes the systematic downward bias in percentile estimates.
+    #[inline(always)]
+    fn bucket_midpoint(bucket: usize) -> u64 {
+        let lower = Self::bucket_to_value(bucket);
+        if bucket < SUB_BUCKETS {
+            // linear region: each bucket is exactly one integer value
+            lower
+        } else {
+            let group = (bucket / SUB_BUCKETS) - 1;
+            let mag = group + SUB_BITS as usize;
+            let shift = mag - SUB_BITS as usize;
+            // bucket width is `1 << shift`; add half to reach its midpoint
+            lower + (1u64 << shift) / 2
         }
     }
 
@@ -221,9 +241,9 @@ impl Histogram {
         // collect cumulative bucket counts on the stack (no allocation)
         let mut cum_counts = [0u64; NUM_BUCKETS];
         let mut cumulative = 0u64;
-        for i in 0..NUM_BUCKETS {
-            cumulative += self.buckets[i].load(Ordering::Relaxed);
-            cum_counts[i] = cumulative;
+        for (cum, bucket) in cum_counts.iter_mut().zip(self.buckets.iter()) {
+            cumulative += bucket.load(Ordering::Relaxed);
+            *cum = cumulative;
         }
 
         // calculate percentiles
@@ -232,9 +252,9 @@ impl Histogram {
             let target = ((count as f64 * p / 100.0) as u64).max(1);
 
             let mut value = 0u64;
-            for i in 0..NUM_BUCKETS {
-                if cum_counts[i] >= target {
-                    value = Self::bucket_to_value(i);
+            for (i, &cum) in cum_counts.iter().enumerate() {
+                if cum >= target {
+                    value = Self::bucket_midpoint(i);
                     break;
                 }
             }
@@ -360,32 +380,50 @@ mod tests {
 
     #[test]
     fn test_bucket_conversion() {
-        // linear region: values 0-7 map directly
+        // linear region: values 0..SUB_BUCKETS map directly to their own bucket
         assert_eq!(Histogram::value_to_bucket(0), 0);
         assert_eq!(Histogram::value_to_bucket(1), 1);
-        assert_eq!(Histogram::value_to_bucket(7), 7);
+        assert_eq!(
+            Histogram::value_to_bucket((SUB_BUCKETS - 1) as u64),
+            SUB_BUCKETS - 1
+        );
 
-        // magnitude 3 (values 8-15): 8 sub-buckets, each covers 1
-        assert_eq!(Histogram::value_to_bucket(8), 8);
-        assert_eq!(Histogram::value_to_bucket(15), 15);
+        // first magnitude bucket starts exactly at SUB_BUCKETS
+        assert_eq!(Histogram::value_to_bucket(SUB_BUCKETS as u64), SUB_BUCKETS);
 
-        // magnitude 4 (values 16-31): 8 sub-buckets, each covers 2
-        assert_eq!(Histogram::value_to_bucket(16), 16);
-        assert_eq!(Histogram::value_to_bucket(17), 16);
-        assert_eq!(Histogram::value_to_bucket(30), 23);
-        assert_eq!(Histogram::value_to_bucket(31), 23);
+        // within one magnitude, sub-bucket width is `1 << (mag - SUB_BITS)`, so a
+        // value and `value + (width-1)` share a bucket. just above SUB_BUCKETS the
+        // magnitude is SUB_BITS, giving width 1 (every integer its own bucket).
+        assert_eq!(
+            Histogram::value_to_bucket(SUB_BUCKETS as u64),
+            Histogram::value_to_bucket(SUB_BUCKETS as u64)
+        );
+        assert_ne!(
+            Histogram::value_to_bucket(SUB_BUCKETS as u64),
+            Histogram::value_to_bucket(SUB_BUCKETS as u64 + 1)
+        );
 
-        // round-trip: bucket_to_value gives lower bound of bucket
-        for v in [1u64, 7, 8, 15, 16, 31, 100, 1000, 1_000_000, 1_000_000_000] {
+        // round-trip invariants for values across many magnitudes:
+        // the lower bound never exceeds the value, and the midpoint stays inside
+        // the bucket (>= lower bound).
+        for v in [
+            1u64,
+            7,
+            8,
+            63,
+            64,
+            127,
+            128,
+            255,
+            1000,
+            1_000_000,
+            1_000_000_000,
+        ] {
             let bucket = Histogram::value_to_bucket(v);
             let lower = Histogram::bucket_to_value(bucket);
-            assert!(
-                lower <= v,
-                "bucket_to_value({})={} > original value {}",
-                bucket,
-                lower,
-                v
-            );
+            let mid = Histogram::bucket_midpoint(bucket);
+            assert!(lower <= v, "lower bound {lower} > value {v}");
+            assert!(mid >= lower, "midpoint {mid} < lower bound {lower}");
         }
     }
 

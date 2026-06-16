@@ -109,13 +109,11 @@ impl Drop for TimerGuard {
 
         // optionally log slow operations
         #[cfg(debug_assertions)]
-        if elapsed > 1_000_000 && self.name.is_some() {
-            // > 1ms
-            eprintln!(
-                "slow operation '{}': {}μs",
-                self.name.unwrap(),
-                elapsed / 1000
-            );
+        if let Some(name) = self.name {
+            if elapsed > 1_000_000 {
+                // > 1ms
+                eprintln!("slow operation '{}': {}μs", name, elapsed / 1000);
+            }
         }
     }
 }

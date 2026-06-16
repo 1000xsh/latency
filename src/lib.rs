@@ -82,13 +82,13 @@ impl TimePoint {
     /// preventing ooo reordering past the code being measured.
     #[inline(always)]
     pub fn now() -> Self {
-        #[cfg(all(target_arch = "x86_64", feature = "enabled"))]
+        #[cfg(feature = "enabled")]
         {
             Self {
                 cycles: rdtsc::rdtsc_start(),
             }
         }
-        #[cfg(not(all(target_arch = "x86_64", feature = "enabled")))]
+        #[cfg(not(feature = "enabled"))]
         {
             Self { cycles: 0 }
         }
@@ -99,16 +99,13 @@ impl TimePoint {
     /// uses rdtscp+lfence to serialize the end measurement.
     #[inline(always)]
     pub fn elapsed_ns(&self) -> u64 {
-        #[cfg(all(target_arch = "x86_64", feature = "enabled"))]
+        #[cfg(feature = "enabled")]
         {
+            // saturating: a backwards/wrapped counter reading yields 0, not a huge value
             let now = rdtsc::rdtsc_end();
-            if now > self.cycles {
-                cycles_to_nanos(now - self.cycles)
-            } else {
-                0
-            }
+            cycles_to_nanos(now.saturating_sub(self.cycles))
         }
-        #[cfg(not(all(target_arch = "x86_64", feature = "enabled")))]
+        #[cfg(not(feature = "enabled"))]
         {
             0
         }
@@ -119,16 +116,13 @@ impl TimePoint {
     /// uses rdtscp+lfence to serialize the end measurement.
     #[inline(always)]
     pub fn elapsed_cycles(&self) -> u64 {
-        #[cfg(all(target_arch = "x86_64", feature = "enabled"))]
+        #[cfg(feature = "enabled")]
         {
+            // saturating: a backwards/wrapped counter reading yields 0, not a huge value
             let now = rdtsc::rdtsc_end();
-            if now > self.cycles {
-                now - self.cycles
-            } else {
-                0
-            }
+            now.saturating_sub(self.cycles)
         }
-        #[cfg(not(all(target_arch = "x86_64", feature = "enabled")))]
+        #[cfg(not(feature = "enabled"))]
         {
             0
         }

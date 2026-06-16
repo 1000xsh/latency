@@ -3,6 +3,7 @@
 //! provides access to cpu cycle counter for ultra-precise timing.
 //! on non-x86_64 platforms, falls back to standard time functions.
 
+#[cfg(target_arch = "x86_64")]
 use std::time::{Duration, Instant};
 
 /// reads the time-stamp counter
@@ -49,9 +50,16 @@ pub fn rdtscp() -> u64 {
     }
 }
 
-/// serialized start timestamp: lfence drains the pipeline then rdtsc reads.
-/// use this for the START of a measurement interval.
-/// cost: ~5-10 cycles more than plain rdtsc, but prevents ooo reordering.
+/// serialized start timestamp for the START of a measurement interval.
+///
+/// `lfence; rdtsc; lfence`: the leading fence keeps the read from drifting
+/// before prior work; the trailing fence keeps the measured instructions from
+/// executing before the counter is read (they have no data dependency on it, so
+/// without it the start would land late and the interval would read short).
+///
+/// `nomem` is intentionally omitted so the block also acts as a compiler memory
+/// barrier -- with `nomem` the compiler is free to reorder the surrounding loads
+/// and stores across the read, which defeats the purpose of a measurement fence.
 #[inline(always)]
 #[cfg(target_arch = "x86_64")]
 pub fn rdtsc_start() -> u64 {
@@ -61,17 +69,23 @@ pub fn rdtsc_start() -> u64 {
         std::arch::asm!(
             "lfence",
             "rdtsc",
+            "lfence",
             out("eax") lo,
             out("edx") hi,
-            options(nostack, nomem),
+            options(nostack),
         );
         ((hi as u64) << 32) | (lo as u64)
     }
 }
 
-/// serialized end timestamp: rdtscp waits for prior instructions,
-/// lfence prevents later instructions from speculatively executing before read.
-/// use this for the END of a measurement interval.
+/// serialized end timestamp for the END of a measurement interval.
+///
+/// `rdtscp` waits for all prior instructions (the measured work) to retire
+/// before reading; the trailing `lfence` blocks later instructions from
+/// executing speculatively before the read.
+///
+/// `nomem` is intentionally omitted so the block doubles as a compiler memory
+/// barrier (see [`rdtsc_start`]).
 #[inline(always)]
 #[cfg(target_arch = "x86_64")]
 pub fn rdtsc_end() -> u64 {
@@ -85,30 +99,41 @@ pub fn rdtsc_end() -> u64 {
             out("eax") lo,
             out("edx") hi,
             out("ecx") _aux,
-            options(nostack, nomem),
+            options(nostack),
         );
         ((hi as u64) << 32) | (lo as u64)
     }
 }
 
+// non-x86_64 fallback: there is no rdtsc, so report monotonic nanoseconds from a
+// process-start origin. the "cycles" returned here are already nanoseconds, which
+// is why `cycles_to_nanos`/`nanos_to_cycles` are the identity on these targets.
+#[cfg(not(target_arch = "x86_64"))]
+fn monotonic_nanos() -> u64 {
+    use std::sync::OnceLock;
+    use std::time::Instant;
+    static ORIGIN: OnceLock<Instant> = OnceLock::new();
+    ORIGIN.get_or_init(Instant::now).elapsed().as_nanos() as u64
+}
+
 #[cfg(not(target_arch = "x86_64"))]
 pub fn rdtsc() -> u64 {
-    0
+    monotonic_nanos()
 }
 
 #[cfg(not(target_arch = "x86_64"))]
 pub fn rdtscp() -> u64 {
-    0
+    monotonic_nanos()
 }
 
 #[cfg(not(target_arch = "x86_64"))]
 pub fn rdtsc_start() -> u64 {
-    0
+    monotonic_nanos()
 }
 
 #[cfg(not(target_arch = "x86_64"))]
 pub fn rdtsc_end() -> u64 {
-    0
+    monotonic_nanos()
 }
 
 /// checks if the cpu supports invariant tsc (constant rate regardless of p-states)
@@ -176,6 +201,7 @@ pub fn calibrate_frequency() -> u64 {
 /// uses (cycles * multiplier) >> 32 instead of u128 division.
 /// single mulq + shift (~3-4 cycles) vs __udivti3 (~40-80 cycles).
 #[inline(always)]
+#[cfg(target_arch = "x86_64")]
 pub fn cycles_to_nanos(cycles: u64) -> u64 {
     let mult = super::nanos_multiplier();
     if mult == 0 {
@@ -186,8 +212,17 @@ pub fn cycles_to_nanos(cycles: u64) -> u64 {
     }
 }
 
+/// on non-x86_64 the counter already returns nanoseconds (see `monotonic_nanos`),
+/// so the conversion is the identity.
+#[inline(always)]
+#[cfg(not(target_arch = "x86_64"))]
+pub fn cycles_to_nanos(cycles: u64) -> u64 {
+    cycles
+}
+
 /// converts nanoseconds to cpu cycles using precomputed Q32 fixed-point multiplier
 #[inline(always)]
+#[cfg(target_arch = "x86_64")]
 pub fn nanos_to_cycles(nanos: u64) -> u64 {
     let mult = super::cycles_multiplier();
     if mult == 0 {
@@ -196,6 +231,14 @@ pub fn nanos_to_cycles(nanos: u64) -> u64 {
     } else {
         ((nanos as u128 * mult as u128) >> 32) as u64
     }
+}
+
+/// on non-x86_64 the counter unit is already nanoseconds, so the conversion is
+/// the identity.
+#[inline(always)]
+#[cfg(not(target_arch = "x86_64"))]
+pub fn nanos_to_cycles(nanos: u64) -> u64 {
+    nanos
 }
 
 /// memory fence to prevent instruction reordering
@@ -271,11 +314,7 @@ mod tests {
         let cycles2 = nanos_to_cycles(nanos);
 
         // should be approximately equal (some rounding error ok)
-        let diff = if cycles2 > cycles {
-            cycles2 - cycles
-        } else {
-            cycles - cycles2
-        };
+        let diff = cycles2.abs_diff(cycles);
 
         assert!(diff < cycles / 100); // less than 1% error
     }
